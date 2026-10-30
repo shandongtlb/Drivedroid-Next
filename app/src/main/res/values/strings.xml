@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DriveDroid Reborn</string>
+    <string name="default_image_name" translatable="false">disk.img</string>
+    <string name="default_image_size" translatable="false">1024</string>
+    <string name="format_fat32">创建 MBR 分区表并格式化为 FAT32</string>
+</resources>
