@@ -34,6 +34,9 @@ probe() {
                     if [ "${gadget_path##*/}" = dd_reborn ]; then
                         printf 'owned_udc=%s\n' "$controller"
                         printf 'owned_file=%s\n' "$(read_value "$gadget_path/functions/mass_storage.0/lun.0/file")"
+                        printf 'owned_ro=%s\n' "$(read_value "$gadget_path/functions/mass_storage.0/lun.0/ro")"
+                        printf 'owned_cdrom=%s\n' "$(read_value "$gadget_path/functions/mass_storage.0/lun.0/cdrom")"
+                        printf 'owned_nofua=%s\n' "$(read_value "$gadget_path/functions/mass_storage.0/lun.0/nofua")"
                     else
                         active_count=$((active_count + 1))
                         printf 'original=%s\n' "$gadget_path"
@@ -60,6 +63,9 @@ probe() {
                     printf 'functions=%s\n' "$(cat "$legacy_path/functions")"
                     printf 'enabled=%s\n' "$(cat "$legacy_path/enable")"
                     printf 'legacy_file=%s\n' "$(cat "$lun_path/file")"
+                    printf 'legacy_ro=%s\n' "$(read_value "$lun_path/ro")"
+                    printf 'legacy_cdrom=%s\n' "$(read_value "$lun_path/cdrom")"
+                    printf 'legacy_nofua=%s\n' "$(read_value "$lun_path/nofua")"
                     printf 'old_ro=%s\n' "$(read_value "$lun_path/ro")"
                     printf 'old_cdrom=%s\n' "$(read_value "$lun_path/cdrom")"
                     break
@@ -70,13 +76,55 @@ probe() {
     done
 }
 
+diagnose_write() {
+    probe
+    if [ -n "${IMAGE:-}" ] && [ -f "$IMAGE" ]; then
+        printf '\nimage_path=%s\n' "$IMAGE"
+        stat -c 'image_bytes=%s allocated_blocks_512=%b mode=%a uid=%u gid=%g' "$IMAGE" || true
+        stat -f -c 'backing_filesystem=%T' "$IMAGE" || true
+        ls -lZ "$IMAGE" || true
+        df -k "$IMAGE" || true
+    fi
+    printf '\n--- USB / storage / permission kernel messages (read only) ---\n'
+    if kernel_messages="$(dmesg 2>&1)"; then
+        filtered="$(printf '%s\n' "$kernel_messages" | tail -n 600 | grep -Ei 'mass.storage|fsg|usb.*(error|fail)|f2fs.*(error|fail)|ext4.*(error|fail)|avc:.*denied|fscrypt|encrypt' | tail -n 80 || true)"
+        if [ -n "$filtered" ]; then
+            printf '%s\n' "$filtered"
+        else
+            printf 'No matching recent messages; this does not prove that writes succeeded.\n'
+        fi
+    else
+        printf 'Kernel log unavailable: %s\n' "$kernel_messages"
+    fi
+}
+
 check_path() {
     [ -f "$IMAGE" ] || fail '镜像路径不存在，或不是普通文件。'
     [ -s "$IMAGE" ] || fail '镜像为空。'
     [ -r "$IMAGE" ] || fail 'Root 无法读取此镜像。'
     if [ "$READONLY" = 0 ]; then
         [ -w "$IMAGE" ] || fail '此镜像不可写。'
+        # O_RDWR without O_TRUNC; checks actual opening, without changing bytes.
+        if ! (exec 3<> "$IMAGE"); then
+            fail '无法以读写方式打开原镜像。请检查存储是否只读，或先导入应用镜像目录。'
+        fi
     fi
+}
+
+verify_lun_mode() {
+    checked_lun="$1"
+    actual_ro="$(cat "$checked_lun/ro")"
+    actual_cdrom=0
+    if [ -f "$checked_lun/cdrom" ]; then
+        actual_cdrom="$(cat "$checked_lun/cdrom")"
+    fi
+    printf 'actual_ro=%s\n' "$actual_ro"
+    printf 'actual_cdrom=%s\n' "$actual_cdrom"
+    if [ "$READONLY" = 0 ] && [ "$actual_ro" != 0 ]; then
+        fail '内核没有接受可写挂载，已退回只读。请先导入应用目录再试；当前挂载会回滚，不会显示可写成功。'
+    fi
+    [ "$actual_ro" = "$READONLY" ] || fail '内核实际读写状态与所选模式不同，已取消挂载。'
+    [ "$actual_cdrom" = "$CDROM" ] || fail '内核实际光驱状态与所选模式不同，已取消挂载。'
 }
 
 mount_configfs() {
@@ -100,28 +148,30 @@ mount_configfs() {
     mkdir -p "$own/functions/mass_storage.0"
     lun="$own/functions/mass_storage.0/lun.0"
     [ -d "$lun" ] || fail '内核没有提供 USB Mass Storage LUN。'
-    printf '\n' > "$lun/file"
-    printf '1\n' > "$lun/removable"
-    printf '%s\n' "$CDROM" > "$lun/cdrom"
-    printf '%s\n' "$READONLY" > "$lun/ro"
-    printf '%s\n' "$IMAGE" > "$lun/file"
-    if [ ! -L "$own/configs/c.1/mass_storage.0" ]; then
-        ln -s "$own/functions/mass_storage.0" "$own/configs/c.1/mass_storage.0"
-    fi
+    [ -z "$(cat "$lun/file")" ] || fail 'USB LUN 中仍有镜像，请先弹出或恢复 USB。'
     switched=0
     rollback() {
         result=$?
         trap - EXIT HUP INT TERM
         if [ "$switched" = 1 ]; then
             printf '\n' > "$own/UDC" || true
-            printf '\n' > "$lun/file" || true
-            if [ -n "$ORIGINAL" ]; then
+            if [ -n "$ORIGINAL" ] && [ -z "$(read_value "$ORIGINAL/UDC")" ]; then
                 printf '%s\n' "$UDC" > "$ORIGINAL/UDC" || true
             fi
         fi
+        # Preparation can fail after opening the image but before switching UDC.
+        printf '\n' > "$lun/file" || true
         exit "$result"
     }
     trap rollback EXIT HUP INT TERM
+    printf '1\n' > "$lun/removable"
+    printf '%s\n' "$CDROM" > "$lun/cdrom"
+    printf '%s\n' "$READONLY" > "$lun/ro"
+    printf '%s\n' "$IMAGE" > "$lun/file"
+    verify_lun_mode "$lun"
+    if [ ! -L "$own/configs/c.1/mass_storage.0" ]; then
+        ln -s "$own/functions/mass_storage.0" "$own/configs/c.1/mass_storage.0"
+    fi
     if [ -n "$ORIGINAL" ]; then
         [ "$(cat "$ORIGINAL/UDC")" = "$UDC" ] || fail '系统 USB 配置已经改变，请重新检测。'
         switched=1
@@ -133,6 +183,7 @@ mount_configfs() {
     sleep 1
     [ "$(cat "$own/UDC")" = "$UDC" ] || fail '系统 USB 服务接管了连接，当前 ROM 不支持此切换方式。'
     [ -n "$(cat "$lun/file")" ] || fail '镜像未成功挂载。'
+    verify_lun_mode "$lun"
     switched=0
     trap - EXIT HUP INT TERM
     printf 'mounted=configfs\n'
@@ -147,6 +198,7 @@ unmount_configfs() {
         fi
     fi
     if [ -f "$own/UDC" ] && [ -n "$(cat "$own/UDC")" ]; then
+        [ "$(cat "$own/UDC")" = "$UDC" ] || fail 'USB 控制器已改变，拒绝断开其他连接。'
         printf '\n' > "$own/UDC"
     fi
     release_result=0
@@ -192,8 +244,10 @@ mount_legacy() {
     fi
     printf '%s\n' "$READONLY" > "$LUN/ro"
     printf '%s\n' "$IMAGE" > "$LUN/file"
+    verify_lun_mode "$LUN"
     printf '1\n' > "$LEGACY/enable"
     [ -n "$(cat "$LUN/file")" ] || fail '镜像未成功挂载。'
+    verify_lun_mode "$LUN"
     trap - EXIT HUP INT TERM
     printf 'mounted=legacy\n'
 }
@@ -218,6 +272,9 @@ unmount_legacy() {
 
 [ "$(id -u)" = 0 ] || fail '没有获得 Root 权限。'
 case "$ACTION" in
+    diagnose_write)
+        diagnose_write
+        ;;
     probe)
         probe
         ;;

@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.drivedroidreborn"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 4
+        versionName = "0.1.3"
     }
 
     compileOptions {
@@ -20,9 +20,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = false
         }
     }
 

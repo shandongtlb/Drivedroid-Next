@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
     private ScrollView listScroll;
     private Bundle drafts = new Bundle();
     private String activeForm = "";
+    private AlertDialog formDialog;
     private final BroadcastReceiver changes = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -123,6 +124,14 @@ public final class MainActivity extends Activity {
     protected void onStop() {
         unregisterReceiver(changes);
         super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (formDialog != null) {
+            formDialog.dismiss();
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -344,9 +353,22 @@ public final class MainActivity extends Activity {
         labels.addView(title);
         labels.addView(subtitle);
         line.addView(labels, new LinearLayout.LayoutParams(0, -2, 1));
-        TextView size = text((mounted ? "已选择\n" : "") + ImageFiles.size(entry.bytes), 12, mounted ? BLUE : MUTED);
+        TextView size = text((mounted ? (app.usb.verified() ? "已挂载\n" : "待确认\n") : "")
+                + ImageFiles.size(entry.bytes), 12, mounted ? BLUE : MUTED);
         size.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         line.addView(size);
+        if (mounted) {
+            Button eject = new Button(this);
+            eject.setText(R.string.eject_image);
+            eject.setTextSize(13);
+            eject.setTextColor(BLUE);
+            eject.setAllCaps(false);
+            eject.setMinWidth(0);
+            eject.setMinimumWidth(0);
+            eject.setContentDescription("卸载镜像：" + entry.title);
+            eject.setOnClickListener(view -> confirmEject(entry));
+            line.addView(eject, new LinearLayout.LayoutParams(dp(64), dp(48)));
+        }
         line.setOnClickListener(view -> showMount(entry));
         line.setOnLongClickListener(view -> {
             imageActions(entry);
@@ -378,6 +400,22 @@ public final class MainActivity extends Activity {
         if (busy()) {
             return;
         }
+        try {
+            if (app.usb.isInUse(entry.path)) {
+                new AlertDialog.Builder(this).setTitle(entry.title)
+                        .setItems(new String[]{"卸载 / 弹出镜像", "检查挂载状态", "镜像详情与管理"}, (dialog, which) -> {
+                            switch (which) {
+                                case 0 -> confirmEject(entry);
+                                case 1 -> detectUsb();
+                                default -> imageActions(entry);
+                            }
+                        }).show();
+                return;
+            }
+        } catch (IOException exception) {
+            error(exception);
+            return;
+        }
         String[] items = {"只读 USB（推荐）", "可写 USB", "只读 CD-ROM", "镜像详情与管理"};
         new AlertDialog.Builder(this).setTitle("挂载镜像为…")
                 .setItems(items, (dialog, which) -> {
@@ -390,12 +428,15 @@ public final class MainActivity extends Activity {
                             + "模式会暂时替换手机的 USB 连接，MTP 和有线 ADB 会断开。弹出后恢复。";
                     if (mode == UsbController.Mode.WRITABLE) {
                         message += "\n\n电脑可以修改此镜像。使用完请先在电脑安全弹出，且不要同时在手机编辑此文件。";
+                        message += "\n\n可写 USB 不会改变镜像内部的文件系统。ISO9660 光盘文件系统仍不能直接复制文件；需要存文件时，请创建 FAT32 .img。";
                     }
                     new AlertDialog.Builder(this).setTitle("挂载镜像")
                             .setMessage(message).setNegativeButton("取消", null)
                             .setPositiveButton("挂载", (confirmation, choice) -> runUsb("正在挂载…",
                                     () -> app.usb.mount(entry, mode, preferences.getString("backend", "auto")),
-                                    "挂载命令已完成，请在电脑检查 USB 设备。")).show();
+                                    mode == UsbController.Mode.WRITABLE
+                                            ? "内核已确认可写 USB；电脑能否复制文件还取决于镜像文件系统。"
+                                            : "挂载模式已核对，请在电脑检查 USB 设备。")).show();
                 }).show();
     }
 
@@ -410,7 +451,9 @@ public final class MainActivity extends Activity {
                 return;
             }
             new AlertDialog.Builder(this).setTitle(state.optString("title"))
-                    .setMessage(state.optString("mode") + "\n" + state.optString("image")
+                    .setMessage("选择的模式：" + state.optString("mode")
+                            + "\n内核状态：" + (app.usb.verified() ? state.optString("actual_mode", "状态未知") : "未确认，请检查状态")
+                            + "\n" + state.optString("image")
                             + "\n\n请先在电脑安全弹出，再恢复手机 USB。若上次挂载失败，也可使用此操作恢复。")
                     .setNegativeButton("关闭", null)
                     .setNeutralButton("检查状态", (dialog, which) -> detectUsb())
@@ -419,6 +462,26 @@ public final class MainActivity extends Activity {
         } catch (IOException exception) {
             error(exception);
         }
+    }
+
+    private void confirmEject(ImageEntry entry) {
+        if (busy()) {
+            return;
+        }
+        try {
+            if (!app.usb.isInUse(entry.path)) {
+                toast("这条镜像当前没有挂载。");
+                return;
+            }
+        } catch (IOException exception) {
+            error(exception);
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("卸载镜像")
+                .setMessage(entry.title + "\n\n请先在电脑安全弹出，然后卸载镜像并恢复手机 USB。镜像文件会保留。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("卸载", (dialog, which) -> runUsb("正在卸载镜像…",
+                        () -> app.usb.eject(entry.path), "镜像已卸载，USB 已恢复。")).show();
     }
 
     private void importImage() {
@@ -432,11 +495,14 @@ public final class MainActivity extends Activity {
                     Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
                             .setType("*/*").addCategory(Intent.CATEGORY_OPENABLE)
                             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                    startActivityForResult(intent, IMPORT_REQUEST);
+                    openFilePicker(intent, IMPORT_REQUEST);
                 }).show();
     }
 
     private void addPath() {
+        if (busy()) {
+            return;
+        }
         LinearLayout form = form();
         EditText title = field(form, "显示名称（可选）", InputType.TYPE_CLASS_TEXT);
         EditText path = field(form, "/storage/emulated/0/Download/example.iso", InputType.TYPE_CLASS_TEXT);
@@ -480,7 +546,7 @@ public final class MainActivity extends Activity {
         fat.setChecked(drafts.getBoolean("create_fat32", true));
         fat.setOnCheckedChangeListener((button, checked) -> drafts.putBoolean("create_fat32", checked));
         form.addView(fat);
-        form.addView(note("64–131072 MiB。FAT32 单个文件最大 4 GiB。取消勾选可生成未格式化的镜像，供 Rufus 等工具写入。空白镜像本身不可引导。"));
+        form.addView(note("64–131072 MiB。创建时完整写入并分配空间，需要一定时间。FAT32 单个文件最大 4 GiB 减 1 字节。取消勾选可生成未格式化镜像，供电脑格式化或写入。"));
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("创建空白镜像").setView(form)
                 .setNegativeButton("取消", null).setPositiveButton("创建", null).create();
         trackDialog(dialog, "create");
@@ -509,17 +575,49 @@ public final class MainActivity extends Activity {
     }
 
     private void imageActions(ImageEntry entry) {
+        boolean mounted;
+        try {
+            mounted = app.usb.isInUse(entry.path);
+        } catch (IOException exception) {
+            error(exception);
+            return;
+        }
+        String[] options = mounted
+                ? new String[]{"查看路径与大小", "修改显示名称", "导出镜像", "从列表移除（保留文件）", "卸载 / 弹出镜像", "USB 写入诊断"}
+                : new String[]{"查看路径与大小", "修改显示名称", "导出镜像", "从列表移除（保留文件）", "创建兼容副本（完整分配空间）"};
         new AlertDialog.Builder(this).setTitle(entry.title)
-                .setItems(new String[]{"查看路径与大小", "修改显示名称", "导出镜像", "从列表移除（保留文件）"}, (dialog, which) -> {
+                .setItems(options, (dialog, which) -> {
                     switch (which) {
                         case 0 -> new AlertDialog.Builder(this).setTitle(entry.title)
                                 .setMessage(entry.path + "\n\n" + ImageFiles.size(entry.bytes))
                                 .setPositiveButton("关闭", null).setNeutralButton("复制路径", (d, w) -> copy(entry.path)).show();
                         case 1 -> rename(entry);
                         case 2 -> export(entry);
-                        default -> forget(entry);
+                        case 3 -> forget(entry);
+                        case 4 -> {
+                            if (mounted) {
+                                confirmEject(entry);
+                            } else {
+                                compatibleCopy(entry);
+                            }
+                        }
+                        case 5 -> diagnoseWrite();
                     }
                 }).show();
+    }
+
+    private void compatibleCopy(ImageEntry entry) {
+        if (busy()) {
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("创建兼容副本")
+                .setMessage("逐块复制「" + entry.title + "」，用于排查稀疏镜像兼容问题。需要额外 "
+                        + ImageFiles.size(entry.bytes) + " 空间。原镜像保持不变；这不能保证解决所有 CRC 错误。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("创建副本", (dialog, which) -> beginTransfer(
+                        new Intent(this, TransferService.class).setAction(TransferService.COPY)
+                                .putExtra("path", entry.path).putExtra("name", "compatible-" + entry.filename())
+                                .putExtra("title", entry.title + " · 兼容副本"))).show();
     }
 
     private void rename(ImageEntry entry) {
@@ -560,9 +658,19 @@ public final class MainActivity extends Activity {
         }
         exportPath = entry.path;
         exportName = entry.filename();
-        startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT)
+        openFilePicker(new Intent(Intent.ACTION_CREATE_DOCUMENT)
                 .addCategory(Intent.CATEGORY_OPENABLE).setType("application/octet-stream")
                 .putExtra(Intent.EXTRA_TITLE, exportName), EXPORT_REQUEST);
+    }
+
+    private void openFilePicker(Intent intent, int request) {
+        try {
+            startActivityForResult(intent, request);
+        } catch (android.content.ActivityNotFoundException exception) {
+            error(new IOException("系统文件选择器不可用，请启用系统「文件」应用后再试。"));
+        } catch (SecurityException exception) {
+            error(new IOException("系统拒绝打开文件选择器：" + exception.getMessage()));
+        }
     }
 
     private void showSettings() {
@@ -582,6 +690,7 @@ public final class MainActivity extends Activity {
                                 }).setNegativeButton("取消", null).show());
         setting(list, "弹出 / 恢复 USB", "恢复本应用切换前的 USB 连接", this::showHosting);
         setting(list, "检测报告", "查看或复制最近一次检测结果", this::diagnostics);
+        setting(list, "USB 写入诊断", "写入报 CRC / I/O 错误后，读取内核日志和镜像状态", this::diagnoseWrite);
         section(list, "镜像");
         setting(list, "按名称排序", preferences.getBoolean("sort", true) ? "已开启" : "按添加顺序",
                 () -> {
@@ -589,7 +698,7 @@ public final class MainActivity extends Activity {
                     showSettings();
                 });
         setting(list, "镜像目录", getFilesDir() + "/images", () -> copy(getFilesDir() + "/images"));
-        setting(list, "镜像下载仓库", preferences.getString("repository", "https://dd.hexed.pw/repo.json"), this::repositoryDialog);
+        setting(list, "镜像下载仓库", preferences.getString("repository", "未配置"), this::repositoryDialog);
         setting(list, "最近的文件操作", "查看完成结果、失败原因或中断记录", () -> {
             SharedPreferences transfers = getSharedPreferences("transfers", MODE_PRIVATE);
             String message = transfers.getString("result", "尚无文件操作。");
@@ -600,11 +709,15 @@ public final class MainActivity extends Activity {
             new AlertDialog.Builder(this).setTitle("文件操作结果").setMessage(message).setPositiveButton("关闭", null).show();
         });
         section(list, "关于");
-        setting(list, "DriveDroid Reborn 0.1.1", "独立实现 · Android 8–17 · 目标 API 37", this::showHelp);
+        setting(list, "DriveDroid Reborn " + BuildConfig.VERSION_NAME, "独立实现 · Android 8–17 · 目标 API 37", this::showHelp);
     }
 
     private void detectUsb() {
         runUsb("正在检测 Root 和 USB…", () -> app.usb.inspect(), null, this::diagnostics);
+    }
+
+    private void diagnoseWrite() {
+        runUsb("正在读取 USB 写入诊断…", () -> app.usb.diagnoseWrite(), null, this::diagnostics);
     }
 
     private void diagnostics() {
@@ -624,7 +737,7 @@ public final class MainActivity extends Activity {
         LinearLayout list = scrollingBody();
         section(list, "镜像仓库");
         setting(list, "加载 / 刷新发行版列表", app.catalogBusy ? "正在获取仓库…" :
-                "社区源 · " + preferences.getString("repository", "https://dd.hexed.pw/repo.json"), this::loadCatalog);
+                "自定义源 · " + preferences.getString("repository", "未配置"), this::loadCatalog);
         setting(list, "更换仓库", "支持 DriveDroid 格式的 HTTPS JSON 仓库", this::repositoryDialog);
         if (app.catalog != null) {
             section(list, "可下载的发行版（" + app.catalog.size() + "）");
@@ -634,7 +747,7 @@ public final class MainActivity extends Activity {
             }
         }
         section(list, "从直接链接下载");
-        setting(list, "输入下载地址", "HTTPS · 后台下载 · 可选 SHA-256 校验", this::downloadDialog);
+        setting(list, "输入下载地址", "HTTPS · 后台下载 · 必须核对发布方 SHA-256", this::downloadDialog);
         section(list, "发行版官网");
         setting(list, "Ubuntu", "选择 Desktop ISO，再复制直接下载链接", () -> browse("https://ubuntu.com/download/desktop"));
         setting(list, "Debian", "安装镜像与校验文件", () -> browse("https://www.debian.org/distrib/"));
@@ -651,7 +764,8 @@ public final class MainActivity extends Activity {
         LinearLayout form = form();
         EditText url = field(form, "https://example.org/system.iso", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         EditText filename = field(form, "保存文件名，如 system.iso", InputType.TYPE_CLASS_TEXT);
-        EditText sha = field(form, "SHA-256（可选）", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        EditText sha = field(form, "发布方 SHA-256（必填）", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        form.addView(note("请从发行方官网或已验证的发布声明取得校验值。镜像目录中的校验值不作为可信来源；本应用不验证发行方数字签名。"));
         trackField(url, "download_url", "");
         trackField(filename, "download_filename", "");
         trackField(sha, "download_sha", "");
@@ -674,8 +788,8 @@ public final class MainActivity extends Activity {
                 return;
             }
             String hash = sha.getText().toString().trim();
-            if (!hash.isEmpty() && !hash.matches("(?i)[a-f0-9]{64}")) {
-                sha.setError("SHA-256 应为 64 位十六进制字符");
+            if (!hash.matches("(?i)[a-f0-9]{64}")) {
+                sha.setError("必须填写发布方提供的 64 位 SHA-256");
                 return;
             }
             dialog.dismiss();
@@ -688,8 +802,8 @@ public final class MainActivity extends Activity {
     private void repositoryDialog() {
         LinearLayout form = form();
         EditText url = field(form, "HTTPS JSON 仓库地址", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        trackField(url, "repository_url", preferences.getString("repository", "https://dd.hexed.pw/repo.json"));
-        form.addView(note("默认源由社区维护，与本应用及原作者无隶属关系。只显示 HTTPS 的未压缩 ISO / IMG；下载前会显示实际文件地址。"));
+        trackField(url, "repository_url", preferences.getString("repository", ""));
+        form.addView(note("没有预设第三方源。仅添加你信任的仓库；目录只用于查找下载地址，不验证镜像发布者身份。"));
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("镜像下载仓库").setView(form)
                 .setNegativeButton("取消", null).setPositiveButton("保存", null).create();
         trackDialog(dialog, "repository");
@@ -716,7 +830,11 @@ public final class MainActivity extends Activity {
         if (busy() || app.catalogBusy) {
             return;
         }
-        String address = preferences.getString("repository", "https://dd.hexed.pw/repo.json");
+        String address = preferences.getString("repository", "");
+        if (address.trim().isEmpty()) {
+            repositoryDialog();
+            return;
+        }
         app.catalogBusy = true;
         showDownloads();
         app.catalogWorker.execute(() -> {
@@ -749,11 +867,13 @@ public final class MainActivity extends Activity {
             ImageCatalog.Release release = distro.releases().get(which);
             new AlertDialog.Builder(this).setTitle("下载这个镜像？")
                     .setMessage(release.name() + "\n" + ImageFiles.size(release.bytes()) + "\n\n" + release.url()
-                            + (release.sha256().isEmpty() ? "\n\n仓库未提供 SHA-256；可在直接链接下载里手动填写。" : "\n\n将校验仓库提供的 SHA-256。"))
-                    .setNegativeButton("取消", null).setPositiveButton("下载", (confirmation, choice) ->
-                            beginTransfer(new Intent(this, TransferService.class).setAction(TransferService.DOWNLOAD)
-                                    .putExtra("name", release.filename()).putExtra("title", release.name())
-                                    .putExtra("url", release.url()).putExtra("sha256", release.sha256()))).show();
+                            + "\n\n下一步必须填写从发布方可信渠道取得的 SHA-256。")
+                    .setNegativeButton("取消", null).setPositiveButton("填写校验值", (confirmation, choice) -> {
+                        drafts.putString("download_url", release.url());
+                        drafts.putString("download_filename", release.filename());
+                        drafts.remove("download_sha");
+                        downloadDialog();
+                    }).show();
         }).setNegativeButton("返回", null).show();
     }
 
@@ -768,9 +888,10 @@ public final class MainActivity extends Activity {
         section(list, "兼容性");
         paragraph(list, "Android 17 / OPPO", "按 Android 17（API 37）构建，未对你的 OPPO Find X9 Ultra 真机调试。若内核没有 USB Mass Storage，或 ColorOS USB 服务持续接管，应用不能单凭 Root 保证成功。不会自动改 SELinux、停止系统服务或刷内核。");
         paragraph(list, "ISO 与启动方式", "Linux hybrid ISO 通常可使用 USB 模式。部分 Windows ISO 需要 CD-ROM 模式，或先创建空白磁盘后由电脑的 Rufus 写入。Secure Boot 和 UEFI 支持取决于镜像本身。");
+        paragraph(list, "可写 USB 与文件系统", "可写模式会先以读写方式打开镜像，挂载后回读内核的 ro / cdrom 标志。只有内核确认才报告成功。ISO9660 光盘文件系统不会因此变为可写；需要复制文件时请创建 FAT32 .img。若 FAT32 镜像仍不能写，请查看 USB 检测报告和电脑的具体提示。");
         paragraph(list, "文件操作", "文件导入与下载在前台服务中执行。取消或中断后保留未完成文件；不自动删除镜像。移除列表记录不释放文件空间。FAT32 单文件上限为 4 GiB 减 1 字节。");
         section(list, "关于这个版本");
-        paragraph(list, "DriveDroid Reborn 0.1.1", "参考 DriveDroid 0.10.50 的界面布局独立实现，非原作者发行版，不包含原版应用源码、图标或 APK。当前提供单镜像挂载。");
+        paragraph(list, "DriveDroid Reborn " + BuildConfig.VERSION_NAME, "参考 DriveDroid 0.10.50 的界面布局独立实现，非原作者发行版，不包含原版应用源码、图标或 APK。当前提供单镜像挂载。");
     }
 
     @Override
@@ -963,9 +1084,13 @@ public final class MainActivity extends Activity {
 
     private void trackDialog(AlertDialog dialog, String form) {
         activeForm = form;
+        formDialog = dialog;
         dialog.setOnDismissListener(ignored -> {
-            if (!isChangingConfigurations()) {
+            if (!isChangingConfigurations() && formDialog == dialog) {
                 activeForm = "";
+            }
+            if (formDialog == dialog) {
+                formDialog = null;
             }
         });
     }

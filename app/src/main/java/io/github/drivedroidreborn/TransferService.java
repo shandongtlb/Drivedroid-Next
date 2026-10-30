@@ -11,10 +11,15 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.IBinder;
 import android.os.Build;
+import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.provider.OpenableColumns;
+import android.system.Os;
+import android.system.OsConstants;
+import android.system.ErrnoException;
 
 import java.io.File;
+import java.io.Closeable;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -33,6 +38,7 @@ public final class TransferService extends Service {
     public static final String CREATE = "create";
     public static final String DOWNLOAD = "download";
     public static final String EXPORT = "export";
+    public static final String COPY = "copy";
     public static final String CANCEL = "cancel";
     public static final AtomicBoolean RUNNING = new AtomicBoolean(false);
     public static volatile String progressText = "";
@@ -45,6 +51,10 @@ public final class TransferService extends Service {
     private PowerManager.WakeLock wakeLock;
     private long lastProgress;
     private String taskTitle;
+    private volatile Closeable activeInput;
+    private boolean ownsTask;
+    private int latestStartId;
+    private volatile boolean writingPrivateImage;
 
     @Override
     public void onCreate() {
@@ -56,36 +66,56 @@ public final class TransferService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        latestStartId = startId;
         if (intent == null) {
             stopSelf(startId);
             return START_NOT_STICKY;
         }
         if (CANCEL.equals(intent.getAction())) {
-            cancelTask();
+            if (ownsTask) {
+                cancelTask();
+            } else {
+                stopSelf(startId);
+            }
+            return START_NOT_STICKY;
+        }
+        String action = intent.getAction();
+        if (!IMPORT.equals(action) && !EXPORT.equals(action) && !DOWNLOAD.equals(action)
+                && !CREATE.equals(action) && !COPY.equals(action)) {
+            if (!ownsTask) {
+                stopSelf(startId);
+            }
             return START_NOT_STICKY;
         }
         if (!RUNNING.compareAndSet(false, true)) {
             return START_NOT_STICKY;
         }
+        ownsTask = true;
         cancelled = false;
+        lastProgress = 0;
+        writingPrivateImage = !EXPORT.equals(action);
         taskTitle = intent.getStringExtra("title");
         if (taskTitle == null || taskTitle.trim().isEmpty()) {
             taskTitle = "镜像操作";
         }
         progressText = "正在准备：" + taskTitle;
         progressPercent = -1;
-        getSharedPreferences("transfers", MODE_PRIVATE).edit()
-                .putBoolean("interrupted", true).putString("result", progressText).apply();
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIFICATION_ID, notification(progressText), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            startForeground(NOTIFICATION_ID, notification(progressText));
+        try {
+            getSharedPreferences("transfers", MODE_PRIVATE).edit()
+                    .putBoolean("interrupted", true).putString("result", progressText).remove("partial").apply();
+            if (Build.VERSION.SDK_INT >= 29) {
+                startForeground(NOTIFICATION_ID, notification(progressText), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            } else {
+                startForeground(NOTIFICATION_ID, notification(progressText));
+            }
+            wakeLock = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                    "DriveDroidReborn:transfer");
+            wakeLock.acquire(6 * 60 * 60 * 1000L);
+            app.changed();
+            app.worker.execute(() -> perform(intent));
+        } catch (RuntimeException exception) {
+            finishTask("无法开始文件操作：" + exception.getMessage());
         }
-        wakeLock = getSystemService(PowerManager.class).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
-                "DriveDroidReborn:transfer");
-        wakeLock.acquire(6 * 60 * 60 * 1000L);
-        app.changed();
-        app.worker.execute(() -> perform(intent));
         return START_NOT_STICKY;
     }
 
@@ -93,11 +123,16 @@ public final class TransferService extends Service {
         File destination = null;
         String result;
         try {
+            checkCancelled();
             String action = intent.getAction();
             if (EXPORT.equals(action)) {
                 exportImage(intent);
+                checkCancelled();
                 result = "镜像已导出。";
             } else {
+                if (DOWNLOAD.equals(action)) {
+                    TransferPolicy.requireChecksum(intent.getStringExtra("sha256"));
+                }
                 String name = intent.getStringExtra("name");
                 if (IMPORT.equals(action)) {
                     Uri uri = requireUri(intent);
@@ -106,6 +141,29 @@ public final class TransferService extends Service {
                         throw new IOException("请选择 .iso 或 .img 文件；压缩包请先解压。");
                     }
                 }
+                long expected = -1;
+                if (IMPORT.equals(action)) {
+                    expected = documentSize(requireUri(intent));
+                } else if (COPY.equals(action)) {
+                    String sourcePath = intent.getStringExtra("path");
+                    if (sourcePath == null || app.usb.isInUse(sourcePath)) {
+                        throw new IOException("请先卸载原镜像再创建兼容副本。");
+                    }
+                    File source = new File(sourcePath);
+                    if (!source.isFile() || source.length() == 0) {
+                        throw new IOException("无法读取原镜像。");
+                    }
+                    expected = source.length();
+                } else if (CREATE.equals(action)) {
+                    expected = intent.getLongExtra("bytes", 0);
+                    if (expected < 64 * Fat32Image.MIB || expected > 131072 * Fat32Image.MIB) {
+                        throw new IOException("镜像大小必须在 64 MiB 到 128 GiB 之间。");
+                    }
+                }
+                if (expected >= 0) {
+                    requireSpace(expected);
+                }
+                checkCancelled();
                 destination = app.images.reserve(name);
                 if (!getSharedPreferences("transfers", MODE_PRIVATE).edit()
                         .putString("partial", destination.getAbsolutePath()).commit()) {
@@ -115,21 +173,29 @@ public final class TransferService extends Service {
                     long bytes = intent.getLongExtra("bytes", 0);
                     requireSpace(bytes);
                     updateProgress(0, bytes);
-                    Fat32Image.create(destination, bytes, intent.getBooleanExtra("fat32", true));
+                    Fat32Image.create(destination, bytes, intent.getBooleanExtra("fat32", true),
+                            true, completed -> updateProgress(completed, bytes));
+                } else if (COPY.equals(action)) {
+                    long contentLength = expected;
+                    try (InputStream input = new FileInputStream(intent.getStringExtra("path"));
+                         FileOutputStream output = new FileOutputStream(destination)) {
+                        activeInput = input;
+                        long copied = ImageFiles.copy(input, output, completed -> updateProgress(completed, contentLength));
+                        output.getFD().sync();
+                        verifyLength(contentLength, copied);
+                    }
                 } else if (IMPORT.equals(action)) {
                     Uri uri = requireUri(intent);
-                    long expected = documentSize(uri);
-                    if (expected > 0) {
-                        requireSpace(expected);
-                    }
+                    long contentLength = expected;
                     try (InputStream input = getContentResolver().openInputStream(uri);
                          FileOutputStream output = new FileOutputStream(destination)) {
                         if (input == null) {
                             throw new IOException("无法打开选择的文件。");
                         }
-                        long copied = ImageFiles.copy(input, output, bytes -> updateProgress(bytes, expected));
+                        activeInput = input;
+                        long copied = ImageFiles.copy(input, output, bytes -> updateProgress(bytes, contentLength));
                         output.getFD().sync();
-                        verifyLength(expected, copied);
+                        verifyLength(contentLength, copied);
                     }
                 } else if (DOWNLOAD.equals(action)) {
                     download(intent, destination);
@@ -149,9 +215,11 @@ public final class TransferService extends Service {
                 getSharedPreferences("transfers", MODE_PRIVATE).edit().remove("partial").apply();
             }
         } catch (Exception exception) {
-            result = "操作未完成：" + exception.getMessage();
+            result = cancelled ? "操作已取消。" : "操作未完成：" + exception.getMessage();
             if (destination != null) {
-                result += "\n未完成的文件已保留，可通过系统文件工具手动处理：\n" + destination.getAbsolutePath();
+                result += "\n未完成的文件已保留，可通过支持 Root 的文件工具手动处理：\n" + destination.getAbsolutePath();
+            } else if (EXPORT.equals(intent.getAction())) {
+                result += "\n导出位置可能有不完整文件，请手动检查。";
             }
         } finally {
             HttpURLConnection current = connection;
@@ -159,28 +227,30 @@ public final class TransferService extends Service {
                 current.disconnect();
             }
             connection = null;
+            activeInput = null;
         }
-        String finalResult = result;
+        finishTask(result);
+    }
+
+    private void finishTask(String result) {
         getSharedPreferences("transfers", MODE_PRIVATE).edit()
                 .putBoolean("interrupted", false).putString("result", result).apply();
         app.main.post(() -> {
-            progressText = finalResult;
+            progressText = result;
             progressPercent = -1;
             if (wakeLock != null && wakeLock.isHeld()) {
                 wakeLock.release();
             }
             stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            stopSelf(latestStartId);
+            ownsTask = false;
             RUNNING.set(false);
             app.changed();
         });
     }
 
     private void download(Intent intent, File destination) throws Exception {
-        String checksum = intent.getStringExtra("sha256");
-        if (checksum != null && !checksum.trim().isEmpty() && !checksum.matches("(?i)[a-f0-9]{64}")) {
-            throw new IOException("SHA-256 必须是 64 位十六进制字符。");
-        }
+        String checksum = TransferPolicy.requireChecksum(intent.getStringExtra("sha256"));
         URL url = new URI(intent.getStringExtra("url")).toURL();
         for (int redirect = 0; redirect <= 5; redirect++) {
             checkCancelled();
@@ -217,6 +287,7 @@ public final class TransferService extends Service {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             try (InputStream input = new DigestInputStream(connection.getInputStream(), digest);
                  FileOutputStream output = new FileOutputStream(destination)) {
+                activeInput = input;
                 long copied = ImageFiles.copy(input, output, bytes -> updateProgress(bytes, expected));
                 output.getFD().sync();
                 verifyLength(expected, copied);
@@ -225,7 +296,7 @@ public final class TransferService extends Service {
             for (byte value : digest.digest()) {
                 actual.append(String.format(Locale.ROOT, "%02x", value & 0xff));
             }
-            if (checksum != null && !checksum.trim().isEmpty() && !checksum.equalsIgnoreCase(actual.toString())) {
+            if (!checksum.equalsIgnoreCase(actual.toString())) {
                 throw new IOException("SHA-256 不匹配，文件没有加入镜像列表。实际值：" + actual);
             }
             return;
@@ -239,17 +310,47 @@ public final class TransferService extends Service {
             throw new IOException("请先弹出镜像，再导出文件。");
         }
         File source = new File(path);
-        try (InputStream input = new FileInputStream(source);
-             OutputStream output = getContentResolver().openOutputStream(requireUri(intent), "w")) {
-            if (output == null) {
+        long expected = source.length();
+        if (!source.isFile() || expected <= 0) {
+            throw new IOException("原镜像不存在或为空。");
+        }
+        // "rw" does not truncate. Compare the actual descriptors before touching
+        // the destination, including when a provider points back at the source.
+        try (FileInputStream input = new FileInputStream(source);
+             ParcelFileDescriptor target = getContentResolver().openFileDescriptor(requireUri(intent), "rw")) {
+            if (target == null) {
                 throw new IOException("无法打开导出位置。");
             }
-            ImageFiles.copy(input, output, bytes -> updateProgress(bytes, source.length()));
+            var sourceStat = Os.fstat(input.getFD());
+            var targetStat = Os.fstat(target.getFileDescriptor());
+            if (sourceStat.st_dev == targetStat.st_dev && sourceStat.st_ino == targetStat.st_ino) {
+                throw new IOException("导出位置与原镜像是同一个文件，已取消以保护原文件。");
+            }
+            checkCancelled();
+            boolean regularFile = OsConstants.S_ISREG(targetStat.st_mode);
+            if (regularFile) {
+                Os.ftruncate(target.getFileDescriptor(), 0);
+            }
+            try (OutputStream output = new ParcelFileDescriptor.AutoCloseOutputStream(target)) {
+                activeInput = input;
+                long copied = ImageFiles.copy(input, output, bytes -> updateProgress(bytes, expected));
+                checkCancelled();
+                verifyLength(expected, copied);
+                if (regularFile) {
+                    Os.fsync(target.getFileDescriptor());
+                }
+            }
+        } catch (ErrnoException exception) {
+            throw new IOException("无法安全写入导出位置，请改用本地文件目录。", exception);
         }
     }
 
     private void updateProgress(long bytes, long expected) throws IOException {
         checkCancelled();
+        // Called before each write; independent of notification throttling.
+        if (writingPrivateImage) {
+            requireSpace(256L * 1024);
+        }
         long now = android.os.SystemClock.elapsedRealtime();
         if (now - lastProgress < 500) {
             return;
@@ -258,7 +359,11 @@ public final class TransferService extends Service {
         progressText = taskTitle + " · " + ImageFiles.size(bytes)
                 + (expected > 0 ? " / " + ImageFiles.size(expected) : "");
         progressPercent = expected > 0 ? (int) Math.min(100, bytes * 100 / expected) : -1;
-        getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, notification(progressText));
+        try {
+            getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, notification(progressText));
+        } catch (SecurityException ignored) {
+            // Revoking notification permission must not discard a valid transfer.
+        }
         app.changed();
     }
 
@@ -289,9 +394,7 @@ public final class TransferService extends Service {
     // Use genuinely free space; do not ask the OS to evict other apps' cached files.
     @android.annotation.SuppressLint("UsableSpace")
     private void requireSpace(long bytes) throws IOException {
-        if (bytes > app.images.directory().getUsableSpace() - 64L * 1024 * 1024) {
-            throw new IOException("手机剩余空间不足，至少需要额外保留 64 MiB。");
-        }
+        TransferPolicy.requireSpace(app.images.directory().getUsableSpace(), bytes);
     }
 
     private void verifyLength(long expected, long actual) throws IOException {
@@ -316,10 +419,13 @@ public final class TransferService extends Service {
         try (Cursor cursor = getContentResolver().query(uri,
                 new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
-                return cursor.getString(0);
+                String name = cursor.getString(0);
+                if (name != null && !name.trim().isEmpty()) {
+                    return name;
+                }
             }
         }
-        return "image.img";
+        throw new IllegalArgumentException("文件提供程序没有返回文件名，请换用系统文件应用。");
     }
 
     private long documentSize(Uri uri) {
@@ -335,9 +441,21 @@ public final class TransferService extends Service {
     private void cancelTask() {
         cancelled = true;
         HttpURLConnection current = connection;
-        if (current != null) {
-            current.disconnect();
-        }
+        Closeable input = activeInput;
+        Thread cancel = new Thread(() -> {
+            if (current != null) {
+                current.disconnect();
+            }
+            if (input != null) {
+                try {
+                    input.close();
+                } catch (IOException ignored) {
+                    // The worker also closes the stream and records cancellation.
+                }
+            }
+        }, "transfer-cancel");
+        cancel.setDaemon(true);
+        cancel.start();
     }
 
     @Override

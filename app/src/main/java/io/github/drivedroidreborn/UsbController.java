@@ -40,7 +40,9 @@ public final class UsbController {
         preferences = context.getSharedPreferences("usb", Context.MODE_PRIVATE);
     }
 
-    public synchronized JSONObject session() throws IOException {
+    // UI reads must never wait for the monitor held by a slow su operation.
+    // SharedPreferences is thread-safe; every caller receives its own JSON copy.
+    public JSONObject session() throws IOException {
         String value = preferences.getString("session", "");
         if (value.isEmpty()) {
             return null;
@@ -56,12 +58,13 @@ public final class UsbController {
         return verified;
     }
 
-    public synchronized boolean isInUse(String path) throws IOException {
+    public boolean isInUse(String path) throws IOException {
         JSONObject state = session();
         return state != null && path.equals(state.optString("image"));
     }
 
     public synchronized Map<String, String> inspect() throws IOException {
+        verified = false;
         Map<String, String> info = execute("probe", Collections.emptyMap());
         JSONObject state = session();
         if (state != null && !state.optString("boot").equals(info.get("boot"))) {
@@ -74,6 +77,17 @@ public final class UsbController {
                 : "1".equals(info.get("enabled"))
                         && "mass_storage".equals(info.get("functions"))
                         && !info.getOrDefault("legacy_file", "").isEmpty());
+        if (state != null) {
+            String prefix = state.optString("backend").equals("configfs") ? "owned_" : "legacy_";
+            try {
+                state.put("actual_ro", info.getOrDefault(prefix + "ro", ""));
+                state.put("actual_cdrom", info.getOrDefault(prefix + "cdrom", ""));
+                state.put("actual_mode", actualMode(state.optString("actual_ro"), state.optString("actual_cdrom")));
+                saveSession(state);
+            } catch (JSONException exception) {
+                throw new IOException(exception);
+            }
+        }
         preferences.edit().putString("diagnostics", diagnosticText(info)).apply();
         return info;
     }
@@ -134,13 +148,18 @@ public final class UsbController {
             state.put("image", entry.path);
             state.put("title", entry.title);
             state.put("mode", mode.label);
+            state.put("requested_mode", mode.name());
             state.put("boot", info.getOrDefault("boot", ""));
             saveSession(state);
             Map<String, String> args = arguments(state);
             args.put("READONLY", mode.readonly);
             args.put("CDROM", mode.cdrom);
             verified = false;
-            execute(configfs ? "mount_configfs" : "mount_legacy", args);
+            Map<String, String> result = execute(configfs ? "mount_configfs" : "mount_legacy", args);
+            state.put("actual_ro", result.getOrDefault("actual_ro", ""));
+            state.put("actual_cdrom", result.getOrDefault("actual_cdrom", ""));
+            state.put("actual_mode", actualMode(state.optString("actual_ro"), state.optString("actual_cdrom")));
+            saveSession(state);
             verified = true;
         } catch (JSONException exception) {
             throw new IOException(exception);
@@ -148,10 +167,18 @@ public final class UsbController {
     }
 
     public synchronized void eject() throws IOException {
+        eject(null);
+    }
+
+    public synchronized void eject(String expectedImage) throws IOException {
         JSONObject state = session();
         if (state == null) {
             return;
         }
+        if (expectedImage != null && !expectedImage.equals(state.optString("image"))) {
+            throw new IOException("当前挂载的镜像已经改变，请重新选择，未卸载其他镜像。");
+        }
+        verified = false;
         Map<String, String> info = execute("probe", Collections.emptyMap());
         if (!state.optString("boot").equals(info.get("boot"))) {
             clearSession();
@@ -161,8 +188,30 @@ public final class UsbController {
         clearSession();
     }
 
+    static String actualMode(String readonly, String cdrom) {
+        if ("1".equals(cdrom) && "1".equals(readonly)) {
+            return "只读 CD-ROM";
+        }
+        if (!"0".equals(cdrom)) {
+            return "状态未知";
+        }
+        if ("0".equals(readonly)) {
+            return "可写 USB（内核已确认）";
+        }
+        return "1".equals(readonly) ? "只读 USB" : "状态未知";
+    }
+
     public String lastDiagnostics() {
         return preferences.getString("diagnostics", "尚未检测 USB。点击检测后会请求 Root 权限。");
+    }
+
+    public synchronized void diagnoseWrite() throws IOException {
+        inspect();
+        JSONObject state = session();
+        RootShell.Result result = runCommand("diagnose_write", state == null ? Collections.emptyMap() : arguments(state));
+        preferences.edit().putString("diagnostics", "DriveDroid Reborn · USB 写入诊断\n"
+                + "请在电脑出现 CRC / I/O 错误后采集。此操作只读取状态和日志，不更改 USB。\n\n"
+                + result.output()).apply();
     }
 
     public static void validateImagePath(String path) throws IOException {
@@ -197,7 +246,7 @@ public final class UsbController {
         }
     }
 
-    private Map<String, String> execute(String action, Map<String, String> arguments)
+    private RootShell.Result runCommand(String action, Map<String, String> arguments)
             throws IOException {
         StringBuilder script = new StringBuilder("ACTION=").append(RootShell.quote(action)).append('\n');
         for (var entry : arguments.entrySet()) {
@@ -212,8 +261,21 @@ public final class UsbController {
             }
             script.append(new String(output.toByteArray(), StandardCharsets.UTF_8));
         }
-        RootShell.Result result = root.run(script.toString());
-        result.requireSuccess();
+        RootShell.Result result;
+        try {
+            result = root.run(script.toString());
+            result.requireSuccess();
+        } catch (IOException exception) {
+            preferences.edit().putString("diagnostics", "最近的 USB 操作未完成：" + action
+                    + "\n\n" + exception.getMessage() + "\n\n已有恢复记录会保留。").apply();
+            throw exception;
+        }
+        return result;
+    }
+
+    private Map<String, String> execute(String action, Map<String, String> arguments)
+            throws IOException {
+        RootShell.Result result = runCommand(action, arguments);
         Map<String, String> response = new LinkedHashMap<>();
         for (String line : result.output().split("\n")) {
             int separator = line.indexOf('=');

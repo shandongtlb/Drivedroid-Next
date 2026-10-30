@@ -91,6 +91,39 @@ public class Fat32ImageTest {
         assertEquals(0, image.length());
     }
 
+    @Test
+    public void fullyAllocatedImageReportsProgressAndHasValidFat32Metadata() throws Exception {
+        File image = image("allocated-");
+        long capacity = 64 * Fat32Image.MIB;
+        java.util.concurrent.atomic.AtomicLong last = new java.util.concurrent.atomic.AtomicLong(-1);
+        Fat32Image.create(image, capacity, true, true, completed -> {
+            assertTrue(completed >= last.get());
+            last.set(completed);
+        });
+        assertEquals(capacity, last.get());
+        try (RandomAccessFile disk = new RandomAccessFile(image, "r")) {
+            assertEquals(0xaa55, Short.toUnsignedInt(read(disk, 0).getShort(510)));
+            assertEquals(0xaa55, Short.toUnsignedInt(read(disk, 2048).getShort(510)));
+            disk.seek(capacity - 1);
+            assertEquals(0, disk.read());
+        }
+    }
+
+    @Test
+    public void fullAllocationCanBeCancelledBeforePublishingAFormattedImage() throws Exception {
+        File image = image("cancelled-allocation-");
+        assertThrows(java.io.IOException.class, () -> Fat32Image.create(image, 64 * Fat32Image.MIB,
+                true, true, completed -> {
+                    if (completed >= Fat32Image.MIB) {
+                        throw new java.io.IOException("cancelled");
+                    }
+                }));
+        assertTrue(image.exists());
+        try (RandomAccessFile disk = new RandomAccessFile(image, "r")) {
+            assertEquals(0, read(disk, 0).getShort(510));
+        }
+    }
+
     private ByteBuffer read(RandomAccessFile disk, long sector) throws Exception {
         byte[] block = new byte[512];
         disk.seek(sector * 512);

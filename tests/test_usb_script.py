@@ -48,7 +48,7 @@ class UsbScriptTest(unittest.TestCase):
             "OLD_CDROM": "0",
         }
 
-    def run_action(self, action, script=SCRIPT):
+    def run_action(self, action, script=SCRIPT, extra_stubs=""):
         values = dict(self.values, ACTION=action)
         assignments = "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
         # ConfigFS creates attribute files itself. The test seeds them manually.
@@ -66,8 +66,7 @@ ln() {
 """
         result = subprocess.run(
             [BASH, "--noprofile", "--norc", "-s"],
-            input=assignments + "\n" + stubs + SCRIPT if script is SCRIPT
-            else assignments + "\n" + stubs + script,
+            input=assignments + "\n" + stubs + extra_stubs + script,
             text=True,
             encoding="utf-8",
             capture_output=True,
@@ -99,6 +98,27 @@ ln() {
         self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
         self.assertEqual("", (self.lun / "file").read_text().strip())
 
+    def test_preparation_failure_releases_image_without_disconnecting_usb(self):
+        target = '        ln -s "$own/functions/mass_storage.0" "$own/configs/c.1/mass_storage.0"'
+        self.assertIn(target, SCRIPT)
+        result = self.run_action("mount_configfs", SCRIPT.replace(target, "        false", 1))
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
+        self.assertEqual("", (self.lun / "file").read_text().strip())
+
+    def test_unbound_but_occupied_lun_is_not_overwritten(self):
+        (self.lun / "file").write_text("/other/image.img")
+        result = self.run_action("mount_configfs")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("/other/image.img", (self.lun / "file").read_text())
+        self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
+
+    def test_eject_does_not_disconnect_a_different_controller(self):
+        (self.own / "UDC").write_text("other-controller")
+        result = self.run_action("unmount_configfs")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("other-controller", (self.own / "UDC").read_text())
+
     def test_missing_image_does_not_disconnect_original_usb(self):
         self.values["IMAGE"] = (self.root / "missing.img").as_posix()
         result = self.run_action("mount_configfs")
@@ -121,6 +141,52 @@ ln() {
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual("1", (self.lun / "cdrom").read_text().strip())
         self.assertEqual("1", (self.lun / "ro").read_text().strip())
+
+    def test_writable_mode_clears_previous_cdrom_and_preserves_image_bytes(self):
+        before = self.image.read_bytes()
+        self.values["READONLY"] = "0"
+        (self.lun / "ro").write_text("1")
+        (self.lun / "cdrom").write_text("1")
+        result = self.run_action("mount_configfs")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("0", (self.lun / "ro").read_text().strip())
+        self.assertEqual("0", (self.lun / "cdrom").read_text().strip())
+        self.assertIn("actual_ro=0", result.stdout)
+        self.assertIn("actual_cdrom=0", result.stdout)
+        self.assertEqual(before, self.image.read_bytes())
+
+    def test_readonly_fallback_is_reported_and_rolled_back_before_usb_switch(self):
+        self.values["READONLY"] = "0"
+        target = '    printf \'%s\\n\' "$IMAGE" > "$lun/file"'
+        self.assertIn(target, SCRIPT)
+        fallback = SCRIPT.replace(target, target + '\n    printf "1\\n" > "$lun/ro"', 1)
+        result = self.run_action("mount_configfs", fallback)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("actual_ro=1", result.stdout)
+        self.assertNotIn("mounted=configfs", result.stdout)
+        self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
+        self.assertEqual("", (self.lun / "file").read_text().strip())
+
+    def test_readonly_fallback_after_binding_restores_original_usb(self):
+        self.values["READONLY"] = "0"
+        mutate_after_bind = """
+sleep() {
+    printf '1\\n' > "$BASE/dd_reborn/functions/mass_storage.0/lun.0/ro"
+}
+"""
+        result = self.run_action("mount_configfs", extra_stubs=mutate_after_bind)
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("mounted=configfs", result.stdout)
+        self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
+        self.assertEqual("", (self.own / "UDC").read_text().strip())
+        self.assertEqual("", (self.lun / "file").read_text().strip())
+
+    def test_requested_readonly_does_not_silently_accept_writable_mode(self):
+        target = '    printf \'%s\\n\' "$IMAGE" > "$lun/file"'
+        wrong_mode = SCRIPT.replace(target, target + '\n    printf "0\\n" > "$lun/ro"', 1)
+        result = self.run_action("mount_configfs", wrong_mode)
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("mounted=configfs", result.stdout)
 
     def prepare_legacy(self):
         legacy = self.root / "android0"
@@ -154,6 +220,39 @@ ln() {
         self.assertEqual("mtp,adb", (legacy / "functions").read_text().strip())
         self.assertEqual("1", (legacy / "enable").read_text().strip())
         self.assertEqual("/some/other.img", (self.lun / "file").read_text())
+
+    def test_legacy_writable_mode_is_verified(self):
+        self.prepare_legacy()
+        self.values["READONLY"] = "0"
+        result = self.run_action("mount_legacy")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("actual_ro=0", result.stdout)
+
+    def test_legacy_readonly_fallback_restores_previous_configuration(self):
+        legacy = self.prepare_legacy()
+        self.values["READONLY"] = "0"
+        target = '    printf \'%s\\n\' "$IMAGE" > "$LUN/file"'
+        fallback = SCRIPT.replace(target, target + '\n    printf "1\\n" > "$LUN/ro"', 1)
+        result = self.run_action("mount_legacy", fallback)
+        self.assertNotEqual(0, result.returncode)
+        self.assertNotIn("mounted=legacy", result.stdout)
+        self.assertEqual("mtp,adb", (legacy / "functions").read_text().strip())
+        self.assertEqual("", (self.lun / "file").read_text().strip())
+
+    def test_write_diagnostics_reports_kernel_error_without_changing_usb_or_image(self):
+        before = self.image.read_bytes()
+        no_real_probe = SCRIPT.replace("probe() {", "probe() {\n    printf 'root=0\\n'\n    return", 1)
+        kernel_stub = """
+dmesg() {
+    printf 'mass_storage: error in file write: -5\\n'
+}
+"""
+        result = self.run_action("diagnose_write", no_real_probe, kernel_stub)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("error in file write: -5", result.stdout)
+        self.assertIn("image_bytes=", result.stdout)
+        self.assertEqual(before, self.image.read_bytes())
+        self.assertEqual("controller.0", (self.original / "UDC").read_text().strip())
 
 
 if __name__ == "__main__":

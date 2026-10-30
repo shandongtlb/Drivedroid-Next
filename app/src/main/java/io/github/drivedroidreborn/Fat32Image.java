@@ -17,6 +17,15 @@ public final class Fat32Image {
     }
 
     public static void create(File file, long bytes, boolean formatted) throws IOException {
+        create(file, bytes, formatted, false, completed -> { });
+    }
+
+    public interface Progress {
+        void update(long completed) throws IOException;
+    }
+
+    public static void create(File file, long bytes, boolean formatted,
+                              boolean fullyAllocate, Progress progress) throws IOException {
         if (bytes < 64 * MIB || bytes > 128 * 1024 * MIB || bytes % 512 != 0) {
             throw new IOException("镜像大小必须在 64 MiB 到 128 GiB 之间。");
         }
@@ -25,10 +34,21 @@ public final class Fat32Image {
                 throw new IOException("拒绝覆盖已有文件。");
             }
             disk.setLength(bytes);
+            if (fullyAllocate) {
+                byte[] zeros = new byte[256 * 1024];
+                long position = 0;
+                while (position < bytes) {
+                    progress.update(position);
+                    int count = (int) Math.min(zeros.length, bytes - position);
+                    disk.write(zeros, 0, count);
+                    position += count;
+                }
+            }
             if (formatted) {
                 format(disk, bytes);
             }
             disk.getFD().sync();
+            progress.update(bytes);
         }
     }
 

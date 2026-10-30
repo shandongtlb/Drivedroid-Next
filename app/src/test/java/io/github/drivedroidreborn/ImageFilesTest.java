@@ -44,4 +44,23 @@ public class ImageFilesTest {
         assertEquals("disk.ISO", ImageFiles.safeName("disk.ISO"));
         assertFalse(ImageFiles.isImage("file.iso.exe"));
     }
+
+    @Test
+    public void longUnicodeNamesFitFilesystemByteLimit() {
+        String name = ImageFiles.safeName("镜像😀".repeat(100) + ".iso");
+        assertTrue(name.getBytes(java.nio.charset.StandardCharsets.UTF_8).length <= 200);
+        assertTrue(name.endsWith(".iso"));
+        assertFalse(name.contains("�"));
+        assertFalse(ImageFiles.isImage(null));
+    }
+
+    @Test
+    public void cancellationBeforeFirstWriteLeavesOutputUntouched() {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        assertThrows(IOException.class, () -> ImageFiles.copy(
+                new ByteArrayInputStream(new byte[1024]), output, bytes -> {
+                    throw new IOException("cancelled");
+                }));
+        assertEquals(0, output.size());
+    }
 }

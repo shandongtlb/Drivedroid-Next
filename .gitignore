@@ -7,3 +7,5 @@ local.properties
 *.iml
 *.jks
 *.keystore
+.signing/
+releases/
